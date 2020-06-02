@@ -61,71 +61,132 @@
 #include "app_error.h"
 #include "bsp.h"
 #include "nrfx_ppi.h"
-#include "nrf_drv_timer.h"
 #include "nrfx_gpiote.h"
 
 #include "nrf_log.h"
 #include "nrf_log_ctrl.h"
 #include "nrf_log_default_backends.h"
 
-const nrf_drv_timer_t capture_timer = NRF_DRV_TIMER_INSTANCE(0);
-
 #define SAMPLE_PIN                      13
-#define GPIOTE_CH_CAPTURE               0
-#define GPIOTE_CH_RESTART               1
+#define GPIOTE_CH_HI_TO_LO              4
+#define GPIOTE_CH_LO_TO_HI              5
+#define CAPTURE_TIMER                   NRF_TIMER3
+#define CAPTURE_TIMER_IRQn              TIMER3_IRQn
+#define CAPTURE_TIMER_IRQHandler        TIMER3_IRQHandler
+#define CMD_TIMEOUT_US                  1000000
 
-/**
- * @brief Handler for timer events.
- */
-void capture_timer_event_handler(nrf_timer_event_t event_type, void* p_context)
+#define CC_NUM                          2
+
+static volatile uint32_t current_cc_index = 0;
+static volatile uint32_t last_cc_value = 0;
+static uint32_t data_buffer[64];
+static uint32_t data_buffer_position = 0;
+
+static void gpiote_capture_reset(void)
 {
-    switch (event_type)
+    current_cc_index = 0;
+    last_cc_value = 0;
+    for(int i = 0; i < CC_NUM; i++)
     {
-        case NRF_TIMER_EVENT_COMPARE0:
-            break;
+        CAPTURE_TIMER->CC[i] = 0;
+    }
+    CAPTURE_TIMER->CC[5] = 0xFFFFFFFF;
+    data_buffer_position = 0;
+    NRF_GPIOTE->EVENTS_IN[GPIOTE_CH_LO_TO_HI] = 0;
+    NRF_GPIOTE->EVENTS_IN[GPIOTE_CH_HI_TO_LO] = 0;
+    NVIC_ClearPendingIRQ(GPIOTE_IRQn);
+}
 
-        default:
-            break;
+void CAPTURE_TIMER_IRQHandler(void)
+{
+    static uint32_t current_cc_index = 0;
+    if(CAPTURE_TIMER->EVENTS_COMPARE[5])
+    {
+        CAPTURE_TIMER->EVENTS_COMPARE[5] = 0;
+
+        gpiote_capture_reset();
+    }
+}
+
+static void process_gpiote_irq(uint32_t cc_index)
+{
+    uint32_t current_cc_value = CAPTURE_TIMER->CC[cc_index];
+    if(current_cc_value > last_cc_value)
+    {
+        data_buffer[data_buffer_position++] = current_cc_value - last_cc_value;
+        CAPTURE_TIMER->CC[5] = current_cc_value + CMD_TIMEOUT_US;
+        last_cc_value = current_cc_value;
+        current_cc_index = (current_cc_index + 1) % CC_NUM;
+    }
+}
+
+void GPIOTE_IRQHandler(void)
+{
+    const uint32_t event_index_list[] = {GPIOTE_CH_HI_TO_LO, GPIOTE_CH_LO_TO_HI};
+    uint32_t current_cc_value;
+    uint32_t cc_index = current_cc_index;
+    for(int i = cc_index; i < (cc_index + CC_NUM); i++)
+    {
+        if(NRF_GPIOTE->EVENTS_IN[event_index_list[i % CC_NUM]])
+        {
+            NRF_GPIOTE->EVENTS_IN[event_index_list[i % CC_NUM]] = 0;
+
+            process_gpiote_irq(i % CC_NUM);
+        }
     }
 }
 
 static void gpiote_capture_init(void)
 {
     uint32_t err_code;
-    static nrf_ppi_channel_t ppi_ch_gpiote_capture;
-    static nrf_ppi_channel_t ppi_ch_gpiote_restart;
-    nrfx_ppi_channel_alloc(&ppi_ch_gpiote_capture);
-    nrfx_ppi_channel_alloc(&ppi_ch_gpiote_restart);
 
-    nrf_drv_timer_config_t timer_cfg = NRF_DRV_TIMER_DEFAULT_CONFIG;
-    err_code = nrf_drv_timer_init(&capture_timer, &timer_cfg, capture_timer_event_handler);
-    APP_ERROR_CHECK(err_code);
+    nrf_gpio_cfg_input(SAMPLE_PIN, NRF_GPIO_PIN_PULLUP);
 
-    NRF_GPIOTE->CONFIG[GPIOTE_CH_CAPTURE] = GPIOTE_CONFIG_MODE_Event << GPIOTE_CONFIG_MODE_Pos |
-                                            GPIOTE_CONFIG_POLARITY_HiToLo << GPIOTE_CONFIG_POLARITY_Pos |
-                                            SAMPLE_PIN << GPIOTE_CONFIG_PSEL_Pos;
-    NRF_GPIOTE->CONFIG[GPIOTE_CH_RESTART] = GPIOTE_CONFIG_MODE_Event << GPIOTE_CONFIG_MODE_Pos |
-                                            GPIOTE_CONFIG_POLARITY_LoToHi << GPIOTE_CONFIG_POLARITY_Pos |
-                                            SAMPLE_PIN << GPIOTE_CONFIG_PSEL_Pos;
+    // Timer init
+    CAPTURE_TIMER->PRESCALER = 4;
+    CAPTURE_TIMER->BITMODE = TIMER_BITMODE_BITMODE_32Bit << TIMER_BITMODE_BITMODE_Pos;
+    CAPTURE_TIMER->SHORTS = TIMER_SHORTS_COMPARE5_STOP_Msk | TIMER_SHORTS_COMPARE5_CLEAR_Msk;
+    CAPTURE_TIMER->INTENSET = TIMER_INTENSET_COMPARE5_Msk;
+    NVIC_EnableIRQ(CAPTURE_TIMER_IRQn);
 
-    nrfx_ppi_channel_assign(ppi_ch_gpiote_capture, 
-                            NRF_GPIOTE->EVENTS_IN[GPIOTE_CH_CAPTURE], 
-                            nrf_drv_timer_capture_task_address_get(&capture_timer, 0));
+    // GPIOTE init
+    NRF_GPIOTE->CONFIG[GPIOTE_CH_HI_TO_LO] = GPIOTE_CONFIG_MODE_Event << GPIOTE_CONFIG_MODE_Pos |
+                                             GPIOTE_CONFIG_POLARITY_HiToLo << GPIOTE_CONFIG_POLARITY_Pos |
+                                             SAMPLE_PIN << GPIOTE_CONFIG_PSEL_Pos;
+    NRF_GPIOTE->CONFIG[GPIOTE_CH_LO_TO_HI] = GPIOTE_CONFIG_MODE_Event << GPIOTE_CONFIG_MODE_Pos |
+                                             GPIOTE_CONFIG_POLARITY_LoToHi << GPIOTE_CONFIG_POLARITY_Pos |
+                                             SAMPLE_PIN << GPIOTE_CONFIG_PSEL_Pos;
 
-    nrfx_ppi_channel_assign(ppi_ch_gpiote_restart, 
-                            NRF_GPIOTE->EVENTS_IN[GPIOTE_CH_RESTART], 
-                            nrf_drv_timer_task_address_get(&capture_timer, NRF_TIMER_TASK_CLEAR));
-    nrfx_ppi_channel_enable(ppi_ch_gpiote_capture);
-    nrfx_ppi_channel_enable(ppi_ch_gpiote_restart);
+    NRF_GPIOTE->INTENSET = GPIOTE_INTENSET_IN0_Msk << GPIOTE_CH_HI_TO_LO |
+                           GPIOTE_INTENSET_IN0_Msk << GPIOTE_CH_LO_TO_HI;
+                            
+    NVIC_EnableIRQ(GPIOTE_IRQn);
 
-    nrfx_timer_resume(&capture_timer);
+    // PPI init
+    static nrf_ppi_channel_t ppi_ch_gpiote_lo_a;
+    static nrf_ppi_channel_t ppi_ch_gpiote_hi_a;
+    nrfx_ppi_channel_alloc(&ppi_ch_gpiote_lo_a);
+    nrfx_ppi_channel_alloc(&ppi_ch_gpiote_hi_a);
+
+    nrfx_ppi_channel_assign(ppi_ch_gpiote_lo_a, 
+                            (uint32_t)&NRF_GPIOTE->EVENTS_IN[GPIOTE_CH_HI_TO_LO], 
+                            (uint32_t)&CAPTURE_TIMER->TASKS_CAPTURE[0]);
+    nrfx_ppi_channel_fork_assign(ppi_ch_gpiote_lo_a, (uint32_t)&CAPTURE_TIMER->TASKS_START);
+
+    nrfx_ppi_channel_assign(ppi_ch_gpiote_hi_a, 
+                            (uint32_t)&NRF_GPIOTE->EVENTS_IN[GPIOTE_CH_LO_TO_HI], 
+                            (uint32_t)&CAPTURE_TIMER->TASKS_CAPTURE[1]);
+    nrfx_ppi_channel_fork_assign(ppi_ch_gpiote_hi_a, (uint32_t)&CAPTURE_TIMER->TASKS_START);
+
+    nrfx_ppi_channel_enable(ppi_ch_gpiote_lo_a);
+    nrfx_ppi_channel_enable(ppi_ch_gpiote_hi_a);
+
+    gpiote_capture_reset();
+
+    CAPTURE_TIMER->TASKS_CLEAR = 1;
+    //CAPTURE_TIMER->TASKS_START = 1;
 }
 
-
-static uint32_t timer_capture_value_get(void)
-{
-    return nrf_drv_timer_capture_get(&capture_timer, 0);
-}
 
 /** @brief Function for main application entry.
  */
@@ -136,16 +197,10 @@ int main(void)
     NRF_LOG_DEFAULT_BACKENDS_INIT();
     NRF_LOG_INFO("GPIOTE capture example started.");
 
-    nrf_gpio_cfg_input(SAMPLE_PIN, NRF_GPIO_PIN_PULLUP);
-
     gpiote_capture_init();
 
     while (true)
     {
-
-        nrf_delay_ms(500);
-        NRF_LOG_INFO("Capture value: %i", timer_capture_value_get());
-
         NRF_LOG_FLUSH();
     }
 }
