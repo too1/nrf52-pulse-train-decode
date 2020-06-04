@@ -87,6 +87,29 @@ static uint32_t data_buffer_complete_size = 0;
 static volatile bool capture_complete = false;
 static volatile bool buffer_overrun = false;
 
+static void interrupt_timer_run(uint32_t int_time_us, uint32_t int_interval_us)
+{
+    NRF_TIMER0->PRESCALER = 4;
+    NRF_TIMER0->CC[0] = int_time_us;
+    NRF_TIMER0->CC[1] = int_interval_us;
+    NRF_TIMER0->SHORTS = TIMER_SHORTS_COMPARE1_CLEAR_Msk;
+    NRF_TIMER0->INTENSET = TIMER_INTENSET_COMPARE1_Msk;
+    NVIC_SetPriority(TIMER0_IRQn, 0);
+    NVIC_EnableIRQ(TIMER0_IRQn);
+    NRF_TIMER0->TASKS_START = 1;
+}
+
+void TIMER0_IRQHandler(void)
+{
+    if(NRF_TIMER0->EVENTS_COMPARE[1])
+    {
+        NRF_TIMER0->EVENTS_COMPARE[1] = 0;
+
+        NRF_TIMER0->EVENTS_COMPARE[0] = 0;
+        while(NRF_TIMER0->EVENTS_COMPARE[0] == 0);
+    }
+}
+
 static void gpiote_capture_reset(void)
 {
     current_cc_index = 0;
@@ -165,6 +188,7 @@ static void gpiote_capture_init(void)
     CAPTURE_TIMER->BITMODE = TIMER_BITMODE_BITMODE_32Bit << TIMER_BITMODE_BITMODE_Pos;
     CAPTURE_TIMER->SHORTS = TIMER_SHORTS_COMPARE5_STOP_Msk | TIMER_SHORTS_COMPARE5_CLEAR_Msk;
     CAPTURE_TIMER->INTENSET = TIMER_INTENSET_COMPARE5_Msk;
+    NVIC_SetPriority(CAPTURE_TIMER_IRQn, 3);
     NVIC_EnableIRQ(CAPTURE_TIMER_IRQn);
 
     // GPIOTE init
@@ -178,6 +202,7 @@ static void gpiote_capture_init(void)
     NRF_GPIOTE->INTENSET = GPIOTE_INTENSET_IN0_Msk << GPIOTE_CH_HI_TO_LO |
                            GPIOTE_INTENSET_IN0_Msk << GPIOTE_CH_LO_TO_HI;
                             
+    NVIC_SetPriority(GPIOTE_IRQn, 3);
     NVIC_EnableIRQ(GPIOTE_IRQn);
 
     // PPI init
@@ -202,12 +227,9 @@ static void gpiote_capture_init(void)
     gpiote_capture_reset();
 
     CAPTURE_TIMER->TASKS_CLEAR = 1;
-    //CAPTURE_TIMER->TASKS_START = 1;
 }
 
 
-/** @brief Function for main application entry.
- */
 int main(void)
 {
 
@@ -216,6 +238,8 @@ int main(void)
     NRF_LOG_INFO("GPIOTE capture example started.");
 
     gpiote_capture_init();
+
+    interrupt_timer_run(40, 500);
 
     while (true)
     {
@@ -234,5 +258,3 @@ int main(void)
     }
 }
 
-
-/** @} */
