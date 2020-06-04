@@ -73,14 +73,19 @@
 #define CAPTURE_TIMER                   NRF_TIMER3
 #define CAPTURE_TIMER_IRQn              TIMER3_IRQn
 #define CAPTURE_TIMER_IRQHandler        TIMER3_IRQHandler
-#define CMD_TIMEOUT_US                  1000000
+#define CMD_TIMEOUT_US                  1000
+#define CAPTURE_BUF_SIZE                256
 
 #define CC_NUM                          2
 
 static volatile uint32_t current_cc_index = 0;
 static volatile uint32_t last_cc_value = 0;
-static uint32_t data_buffer[64];
+static uint32_t data_buffer[CAPTURE_BUF_SIZE];
 static uint32_t data_buffer_position = 0;
+static uint32_t data_buffer_complete[CAPTURE_BUF_SIZE];
+static uint32_t data_buffer_complete_size = 0;
+static volatile bool capture_complete = false;
+static volatile bool buffer_overrun = false;
 
 static void gpiote_capture_reset(void)
 {
@@ -104,6 +109,14 @@ void CAPTURE_TIMER_IRQHandler(void)
     {
         CAPTURE_TIMER->EVENTS_COMPARE[5] = 0;
 
+        //memcpy(data_buffer_complete, data_buffer, data_buffer_position * sizeof(data_buffer[0]));
+        for(int i = 0; i < data_buffer_position; i++)
+        {
+            // Using 50us as a base unit divide down the result
+            data_buffer_complete[i] = (data_buffer[i] + 25) / 50;
+        }
+        data_buffer_complete_size = data_buffer_position;
+        capture_complete = true;
         gpiote_capture_reset();
     }
 }
@@ -113,7 +126,12 @@ static void process_gpiote_irq(uint32_t cc_index)
     uint32_t current_cc_value = CAPTURE_TIMER->CC[cc_index];
     if(current_cc_value > last_cc_value)
     {
-        data_buffer[data_buffer_position++] = current_cc_value - last_cc_value;
+        if(data_buffer_position < CAPTURE_BUF_SIZE)
+        {
+            data_buffer[data_buffer_position++] = current_cc_value - last_cc_value;
+        }
+        else buffer_overrun = true;
+
         CAPTURE_TIMER->CC[5] = current_cc_value + CMD_TIMEOUT_US;
         last_cc_value = current_cc_value;
         current_cc_index = (current_cc_index + 1) % CC_NUM;
@@ -140,7 +158,7 @@ static void gpiote_capture_init(void)
 {
     uint32_t err_code;
 
-    nrf_gpio_cfg_input(SAMPLE_PIN, NRF_GPIO_PIN_PULLUP);
+    nrf_gpio_cfg_input(SAMPLE_PIN, NRF_GPIO_PIN_NOPULL);
 
     // Timer init
     CAPTURE_TIMER->PRESCALER = 4;
@@ -201,6 +219,17 @@ int main(void)
 
     while (true)
     {
+        if(capture_complete)
+        {
+            capture_complete = false;
+            
+            NRF_LOG_RAW_INFO("Capture: ");
+            for(int i = 0; i < data_buffer_complete_size; i++)
+            {
+                NRF_LOG_RAW_INFO("%i, ", data_buffer_complete[i]);
+            }
+            NRF_LOG_RAW_INFO("\r\n");
+        }
         NRF_LOG_FLUSH();
     }
 }
