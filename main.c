@@ -87,26 +87,38 @@ static uint32_t data_buffer_complete_size = 0;
 static volatile bool capture_complete = false;
 static volatile bool buffer_overrun = false;
 
+static volatile uint32_t int_timer_delay_time_us = 50;
+#define INT_TIMER_INT_TIME_US 90
+
 static void interrupt_timer_run(uint32_t int_time_us, uint32_t int_interval_us)
 {
-    NRF_TIMER0->PRESCALER = 4;
-    NRF_TIMER0->CC[0] = int_time_us;
-    NRF_TIMER0->CC[1] = int_interval_us;
-    NRF_TIMER0->SHORTS = TIMER_SHORTS_COMPARE1_CLEAR_Msk;
-    NRF_TIMER0->INTENSET = TIMER_INTENSET_COMPARE1_Msk;
+    NRF_TIMER0->PRESCALER = 0;
+    NRF_TIMER0->BITMODE = TIMER_BITMODE_BITMODE_32Bit << TIMER_BITMODE_BITMODE_Pos;
+    NRF_TIMER0->CC[0] = int_interval_us * 16;
+    NRF_TIMER0->CC[1] = (int_interval_us + int_time_us) * 16;
+    NRF_TIMER0->CC[2] = (int_interval_us + int_time_us + CMD_TIMEOUT_US) * 16;
+    NRF_TIMER0->SHORTS = TIMER_SHORTS_COMPARE2_STOP_Msk | TIMER_SHORTS_COMPARE2_CLEAR_Msk;
+    NRF_TIMER0->INTENSET = TIMER_INTENSET_COMPARE0_Msk;
     NVIC_SetPriority(TIMER0_IRQn, 0);
     NVIC_EnableIRQ(TIMER0_IRQn);
-    NRF_TIMER0->TASKS_START = 1;
+
+    static nrf_ppi_channel_t ppi_ch_debug;
+    nrfx_ppi_channel_alloc(&ppi_ch_debug);
+    nrfx_ppi_channel_assign(ppi_ch_debug, 
+                            (uint32_t)&NRF_GPIOTE->EVENTS_IN[GPIOTE_CH_HI_TO_LO], 
+                            (uint32_t)&NRF_TIMER0->TASKS_START);
+    nrfx_ppi_channel_enable(ppi_ch_debug);
 }
 
 void TIMER0_IRQHandler(void)
 {
-    if(NRF_TIMER0->EVENTS_COMPARE[1])
+    if(NRF_TIMER0->EVENTS_COMPARE[0])
     {
-        NRF_TIMER0->EVENTS_COMPARE[1] = 0;
-
         NRF_TIMER0->EVENTS_COMPARE[0] = 0;
-        while(NRF_TIMER0->EVENTS_COMPARE[0] == 0);
+        nrf_gpio_pin_set(LED_1);
+        NRF_TIMER0->EVENTS_COMPARE[1] = 0;
+        while(NRF_TIMER0->EVENTS_COMPARE[1] == 0);
+        nrf_gpio_pin_clear(LED_1);
     }
 }
 
@@ -157,8 +169,8 @@ static void process_gpiote_irq(uint32_t cc_index)
 
         CAPTURE_TIMER->CC[5] = current_cc_value + CMD_TIMEOUT_US;
         last_cc_value = current_cc_value;
-        current_cc_index = (current_cc_index + 1) % CC_NUM;
     }
+    current_cc_index = (current_cc_index + 1) % CC_NUM;
 }
 
 void GPIOTE_IRQHandler(void)
@@ -166,7 +178,8 @@ void GPIOTE_IRQHandler(void)
     const uint32_t event_index_list[] = {GPIOTE_CH_HI_TO_LO, GPIOTE_CH_LO_TO_HI};
     uint32_t current_cc_value;
     uint32_t cc_index = current_cc_index;
-    for(int i = cc_index; i < (cc_index + CC_NUM); i++)
+    nrf_gpio_pin_set(LED_2);
+    for(int i = cc_index; ; i++)
     {
         if(NRF_GPIOTE->EVENTS_IN[event_index_list[i % CC_NUM]])
         {
@@ -174,7 +187,9 @@ void GPIOTE_IRQHandler(void)
 
             process_gpiote_irq(i % CC_NUM);
         }
+        else if(i >= CC_NUM) break;
     }
+    nrf_gpio_pin_clear(LED_2);
 }
 
 static void gpiote_capture_init(void)
@@ -237,9 +252,15 @@ int main(void)
     NRF_LOG_DEFAULT_BACKENDS_INIT();
     NRF_LOG_INFO("GPIOTE capture example started.");
 
+    nrf_gpio_cfg_output(LED_1);
+    nrf_gpio_cfg_output(LED_2);
+
+    nrf_gpio_cfg_input(BUTTON_3, NRF_GPIO_PIN_PULLUP);
+    nrf_gpio_cfg_input(BUTTON_4, NRF_GPIO_PIN_PULLUP);
+
     gpiote_capture_init();
 
-    interrupt_timer_run(40, 500);
+    interrupt_timer_run(INT_TIMER_INT_TIME_US, int_timer_delay_time_us);
 
     while (true)
     {
@@ -255,6 +276,18 @@ int main(void)
             NRF_LOG_RAW_INFO("\r\n");
         }
         NRF_LOG_FLUSH();
+        if(nrf_gpio_pin_read(BUTTON_3) == 0)
+        {
+            int_timer_delay_time_us--;
+            nrf_delay_ms(10);
+            interrupt_timer_run(INT_TIMER_INT_TIME_US, int_timer_delay_time_us);
+        }
+        if(nrf_gpio_pin_read(BUTTON_4) == 0)
+        {
+            int_timer_delay_time_us++;
+            nrf_delay_ms(10);
+            interrupt_timer_run(INT_TIMER_INT_TIME_US, int_timer_delay_time_us);
+        }
     }
 }
 
